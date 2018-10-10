@@ -12,6 +12,7 @@ import shutil
 import sys
 import tarfile
 import zipfile
+from collections import namedtuple
 
 from . import ports
 from . import shared
@@ -506,6 +507,10 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
   if force:
     logging.debug('forcing stdlibs: ' + str(force))
 
+  # Set of libraries to include on the link line, as opposed to `force` which
+  # is the set of libraries to force include (with --whole-archive).
+  include = set()
+
   # Setting this will only use the forced libs in EMCC_FORCE_STDLIBS. This avoids spending time checking
   # for unresolved symbols in your project files, which can speed up linking, but if you do not have
   # the proper list of actually needed libraries, errors can occur. See below for how we must
@@ -538,7 +543,7 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
       add_back_deps(need) # recurse to get deps of deps
 
   # Scan symbols
-  symbolses = shared.Building.parallel_llvm_nm(list(map(os.path.abspath, temp_files)))
+  symbolses = shared.Building.parallel_llvm_nm([os.path.abspath(t) for t in temp_files])
 
   if len(symbolses) == 0:
     class Dummy(object):
@@ -574,99 +579,126 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
     libc_deps += ['wasm-libc']
   if shared.Settings.USE_PTHREADS:
     libc_name = 'libc-mt'
-    force.add('pthreads')
-    force.add('pthreads_asmjs')
+    include.add('pthreads')
+    include.add('pthreads_asmjs')
+  include.add(malloc_name())
+  if shared.Settings.WASM_BACKEND:
+    include.add('compiler-rt')
 
-  system_libs = [('libcxx',        'a', create_libcxx,      libcxx_symbols,      ['libcxxabi'], True), # noqa
-                 ('libcxxabi',     ext, create_libcxxabi,   libcxxabi_symbols,   [libc_name],   False), # noqa
-                 ('gl',            ext, create_gl,          gl_symbols,          [libc_name],   False), # noqa
-                 ('al',            ext, create_al,          al_symbols,          [libc_name],   False), # noqa
-                 ('html5',         ext, create_html5,       html5_symbols,       [],            False), # noqa
-                 ('compiler-rt',   'a', create_compiler_rt, compiler_rt_symbols, [libc_name],   False), # noqa
-                 (malloc_name(),   ext, create_malloc,      [],                  [],            False)] # noqa
+  Library = namedtuple('Library', ['shortname', 'suffix', 'create', 'symbols', 'deps', 'can_noexcept'])
+
+  system_libs = [Library('libcxx',        'a', create_libcxx,      libcxx_symbols,      ['libcxxabi'], True), # noqa
+                 Library('libcxxabi',     ext, create_libcxxabi,   libcxxabi_symbols,   [libc_name],   False), # noqa
+                 Library('gl',            ext, create_gl,          gl_symbols,          [libc_name],   False), # noqa
+                 Library('al',            ext, create_al,          al_symbols,          [libc_name],   False), # noqa
+                 Library('html5',         ext, create_html5,       html5_symbols,       [],            False), # noqa
+                 Library('compiler-rt',   'a', create_compiler_rt, compiler_rt_symbols, [libc_name],   False), # noqa
+                 Library(malloc_name(),   ext, create_malloc,      [],                  [],            False)] # noqa
 
   if shared.Settings.USE_PTHREADS:
-    system_libs += [('pthreads',       ext, create_pthreads,       pthreads_symbols,       [libc_name],  False), # noqa
-                    ('pthreads_asmjs', ext, create_pthreads_asmjs, asmjs_pthreads_symbols, [libc_name],  False)] # noqa
+    system_libs += [Library('pthreads',       ext, create_pthreads,       pthreads_symbols,       [libc_name],  False), # noqa
+                    Library('pthreads_asmjs', ext, create_pthreads_asmjs, asmjs_pthreads_symbols, [libc_name],  False)] # noqa
 
-  system_libs += [(libc_name, ext, create_libc, libc_symbols, libc_deps, False)]
+  system_libs.append(Library(libc_name, ext, create_libc, libc_symbols, libc_deps, False))
 
   # if building to wasm, we need more math code, since we have less builtins
   if shared.Settings.WASM:
-    system_libs += [('wasm-libc', ext, create_wasm_libc, wasm_libc_symbols, [], False)]
+    system_libs.append(Library('wasm-libc', ext, create_wasm_libc, wasm_libc_symbols, [], False))
 
   # Add libc-extras at the end, as libc may end up requiring them, and they depend on nothing.
-  system_libs += [('libc-extras', ext, create_libc_extras, libc_extras_symbols, [], False)]
+  system_libs.append(Library('libc-extras', ext, create_libc_extras, libc_extras_symbols, [], False))
 
-  force.add(malloc_name())
-  if shared.Settings.WASM_BACKEND:
-    force.add('compiler-rt')
+  ret = []
+  included = set()
 
-  # Go over libraries to figure out which we must include
   def maybe_noexcept(name):
     if shared.Settings.DISABLE_EXCEPTION_CATCHING:
       name += '_noexcept'
     return name
-  ret = []
-  has = need = None
 
-  all_names = [s[0] for s in system_libs]
+  system_libs_map = {l.shortname: l for l in system_libs}
 
-  for shortname, suffix, create, library_symbols, deps, can_noexcept in system_libs:
-    assert all(d in all_names for d in deps)
-    force_this = force_all or shortname in force
-    if can_noexcept:
+  def add_library(lib):
+    if lib.shortname in included:
+      return
+    included.add(lib.shortname)
+
+    shortname = lib.shortname
+    if lib.can_noexcept:
       shortname = maybe_noexcept(shortname)
-    if force_this and not shared.Settings.WASM_OBJECT_FILES:
-      # .a files do not always link in all their parts; don't use them when forced
-      # When using wasm object files there are only .a archives but they get
-      # included via --whole-archive.
-      suffix = 'bc'
-    name = shortname + '.' + suffix
+    name = shortname + '.' + lib.suffix
 
-    if not force_this:
-      need = set()
-      has = set()
+    logging.debug('including %s' % name)
+
+    def do_create():
+      return lib.create(name)
+
+    libfile = shared.Cache.get(name, do_create, extension=lib.suffix)
+    need_whole_archive = lib.shortname in force and lib.suffix != 'bc'
+    ret.append((libfile, need_whole_archive))
+
+    # Recursively add dependencies
+    for d in lib.deps:
+      add_library(system_libs_map[d])
+
+  # Go over libraries to figure out which we must include
+  for lib in system_libs:
+    if lib.shortname in included:
+      continue
+    force_this = lib.shortname in force
+    if not force_this and only_forced:
+      continue
+    include_this = force_this or lib.shortname in include
+
+    if not include_this:
+      need_syms = set()
+      has_syms = set()
       for symbols in symbolses:
         if shared.Settings.VERBOSE:
           logging.debug('undefs: ' + str(symbols.undefs))
-        for library_symbol in library_symbols:
+        for library_symbol in lib.symbols:
           if library_symbol in symbols.undefs:
-            need.add(library_symbol)
+            need_syms.add(library_symbol)
           if library_symbol in symbols.defs:
-            has.add(library_symbol)
-      for haz in has: # remove symbols that are supplied by another of the inputs
-        if haz in need:
-          need.remove(haz)
+            has_syms.add(library_symbol)
+      for haz in has_syms:
+        if haz in need_syms:
+          # remove symbols that are supplied by another of the inputs
+          need_syms.remove(haz)
       if shared.Settings.VERBOSE:
-        logging.debug('considering %s: we need %s and have %s' % (name, str(need), str(has)))
-    if force_this or (len(need) and not only_forced):
-      # We need to build and link the library in
-      logging.debug('including %s' % name)
+        logging.debug('considering %s: we need %s and have %s' % (shortname, str(need_syms), str(has_syms)))
+      if not len(need_syms):
+        continue
 
-      def do_create():
-        return create(name)
-
-      libfile = shared.Cache.get(name, do_create, extension=suffix)
-      ret.append(libfile)
-      force = force.union(deps)
+    # We need to build and link the library in
+    add_library(lib)
 
   if shared.Settings.WASM_BACKEND:
-    ret.append(shared.Cache.get('wasm_compiler_rt.a', lambda: create_wasm_compiler_rt('wasm_compiler_rt.a'), extension='a'))
-    ret.append(shared.Cache.get('wasm_libc_rt.a', lambda: create_wasm_libc_rt('wasm_libc_rt.a'), extension='a'))
+    ret.append((shared.Cache.get('wasm_compiler_rt.a', lambda: create_wasm_compiler_rt('wasm_compiler_rt.a'), extension='a'), False))
+    ret.append((shared.Cache.get('wasm_libc_rt.a', lambda: create_wasm_libc_rt('wasm_libc_rt.a'), extension='a'), False))
 
-  ret.sort(key=lambda x: x.endswith('.a')) # make sure to put .a files at the end.
+  ret.sort(key=lambda x: x[0].endswith('.a')) # make sure to put .a files at the end.
 
-  for actual in ret:
-    if os.path.basename(actual) == 'libcxxabi.bc':
-      # libcxxabi and libcxx *static* linking is tricky. e.g. cxa_demangle.cpp disables c++
-      # exceptions, but since the string methods in the headers are *weakly* linked, then
-      # we might have exception-supporting versions of them from elsewhere, and if libcxxabi
-      # is first then it would "win", breaking exception throwing from those string
-      # header methods. To avoid that, we link libcxxabi last.
-      ret = [f for f in ret if f != actual] + [actual]
+  # libcxxabi and libcxx *static* linking is tricky. e.g. cxa_demangle.cpp disables c++
+  # exceptions, but since the string methods in the headers are *weakly* linked, then
+  # we might have exception-supporting versions of them from elsewhere, and if libcxxabi
+  # is first then it would "win", breaking exception throwing from those string
+  # header methods. To avoid that, we link libcxxabi last.
+  ret.sort(key=lambda x: x[0].endswith('libcxxabi.bc'))
 
-  return ret
+  # Wrap libraries in --whole-archive, as needed.  We need to do this last
+  # since otherwise the abort sorting won't make sense.
+  if force_all:
+    final = ['--whole-archive'] + [r[0] for r in ret] + ['--no-whole-archive']
+  else:
+    final = []
+    for name, need_whole_archive in ret:
+      if need_whole_archive:
+        final += ['--whole-archive', name, '--no-whole-archive']
+      else:
+        final.append(name)
+
+  return final
 
 
 class Ports(object):

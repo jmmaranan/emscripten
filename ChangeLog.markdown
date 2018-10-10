@@ -2044,7 +2044,7 @@ v1.22.0: 8/5/2014
 v1.21.10: 7/29/2014
 -------------------
  - Fixed a Windows-specific issue where the generated output files might contain
-   line endings of form \r\r\n. This caused browser debuggers to get confused
+   line endings of form `\r\r\n. This caused browser debuggers to get confused
    with line numbers. (#2133)
  - Improved the node.js workaround introduced in v1.21.8.
  - Implemented new HTML5 API for direct WebGL context creation, emscripten_webgl_*().
